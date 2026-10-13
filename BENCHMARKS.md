@@ -39,3 +39,30 @@ uncached generation grows the context and gets slower).
 
 Reproducibility: two consecutive runs agreed within <2% on every number
 (speedup 5.69x then 5.65x).
+
+## Milestone 3 — continuous batching (throughput vs concurrency)
+
+`PYTHONPATH=. python bench/bench_concurrent.py` — 2026-10-13, NVIDIA RTX A5000
+
+Prompt = 11 tokens, max_tokens = 64, max_batch = concurrency. Throughput is total
+tokens/sec across all sequences.
+
+| concurrency | throughput (tok/s) | speedup vs 1 |
+| --- | --- | --- |
+| 1 | 45.5 | 1.00x |
+| 4 | 171.6 | 3.77x |
+| 8 | 324.6 | 7.13x |
+| 16 | 585.4 | 12.86x |
+| 32 | 917.3 | 20.14x |
+
+Acceptance (throughput@16 >= 3x throughput@1): **PASS** (12.86x).
+
+Continuous batching (not the fallback static batching): the scheduler admits
+waiting requests into free rows each step and evicts/compacts finished ones, so
+rows are reused mid-run. The strong scaling comes from this model being
+launch-bound per step — folding more sequences into one batched step adds little
+step cost, so tokens/sec rises nearly linearly with the batch until compute
+starts to bind around concurrency 32.
+
+Reproducibility: a second run gave 46.2 / 176.2 / 329.9 / 582.9 / 944.4 tok/s
+(throughput@16 = 12.62x), within ~3% of the above on every level.
