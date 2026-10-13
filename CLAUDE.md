@@ -8,3 +8,4 @@
 - Append all benchmark results to BENCHMARKS.md with the GPU name and date.
 - If stuck on one bug for more than 1 hour, write what you tried to NOTES.md and move to the fallback in SPEC.md if one exists; otherwise stop and leave a clear message.
 - Never download other models or change the model. Never install packages without adding them to requirements.txt.
+- At the end of each milestone, before committing, spawn a fresh-context reviewer subagent that reads the diff against SPEC.md and lists any spec violations or shortcuts. Fix what it finds, then commit.
