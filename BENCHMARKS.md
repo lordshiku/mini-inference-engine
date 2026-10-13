@@ -91,3 +91,30 @@ it and still pass (6 passed).
 
 Reproducibility: a second run gave 1.55 / 1.56 / 1.59 / 3.67x, within ~3% of the
 above on every shape.
+
+## Milestone 5 — this engine vs vLLM (same model, prompt, concurrency)
+
+`PYTHONPATH=. python bench/bench_concurrent.py` and
+`PYTHONPATH=. python bench/bench_vllm.py` — 2026-10-13, NVIDIA RTX A5000
+
+Same model (Qwen2.5-0.5B), same prompt ("Once upon a time, in a land far away,"),
+same concurrency levels, max_tokens = 64, total tokens/sec across all sequences.
+This engine runs fp32; vLLM runs its default bf16 with paged attention — so this
+is "where a simple from-scratch engine lands next to a production one," not a
+dtype-matched contest.
+
+| concurrency | this engine, fp32 (tok/s) | vLLM, bf16 (tok/s) |
+| --- | --- | --- |
+| 1 | 45.5 | 416.8 |
+| 4 | 171.6 | 1427.4 |
+| 8 | 324.6 | 2788.1 |
+| 16 | 585.4 | 5434.0 |
+| 32 | 917.3 | 9592.8 |
+
+vLLM is ~9–10x faster in absolute throughput (bf16, paged attention, fused
+kernels, optimized sampling), but both engines show the same batching win:
+throughput scales roughly with concurrency until compute starts to bind.
+
+Reproducibility: vLLM second run gave 415.0 / 1435.1 / 2850.9 / 5522.0 / 9071.8
+tok/s — within ~5% of the above on every level (worst case 5.4% at concurrency
+32). All benchmark numbers in this file reproduce across two runs within 10%.
