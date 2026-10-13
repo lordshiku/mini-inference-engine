@@ -60,16 +60,35 @@ def load_tokenizer(model_dir):
     return Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
 
 
-def rms_norm(x, weight, eps):
-    """Root-mean-square layer norm: scale each vector to unit RMS, then weight it.
+# Milestone 4: use the fused Triton RMSNorm by default; flip to False to force
+# the pure-PyTorch path (used as the correctness reference and CPU fallback).
+USE_TRITON_RMSNORM = True
 
-    Computed in fp32 for numerical stability, matching the reference behaviour.
+
+def rms_norm_torch(x, weight, eps):
+    """Root-mean-square layer norm in pure PyTorch (the correctness reference).
+
+    Scales each vector to unit RMS then weights it, computed in fp32 for
+    numerical stability, matching the reference behaviour.
     """
     dtype = x.dtype
     x = x.to(torch.float32)
     var = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(var + eps)
     return weight * x.to(dtype)
+
+
+def rms_norm(x, weight, eps):
+    """RMSNorm dispatcher: fused Triton kernel when enabled and on CUDA, else PyTorch.
+
+    This is what the forward passes call, so enabling the kernel transparently
+    replaces the PyTorch implementation everywhere (M4 requirement).
+    """
+    if USE_TRITON_RMSNORM and x.is_cuda:
+        from engine.kernels import rms_norm_triton
+
+        return rms_norm_triton(x, weight, eps)
+    return rms_norm_torch(x, weight, eps)
 
 
 def build_rope_cache(head_dim, max_pos, theta, device, dtype):

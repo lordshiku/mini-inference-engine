@@ -66,3 +66,28 @@ starts to bind around concurrency 32.
 
 Reproducibility: a second run gave 46.2 / 176.2 / 329.9 / 582.9 / 944.4 tok/s
 (throughput@16 = 12.62x), within ~3% of the above on every level.
+
+## Milestone 4 — Triton fused RMSNorm
+
+`PYTHONPATH=. python bench/bench_kernels.py` — 2026-10-13, NVIDIA RTX A5000
+
+Fused Triton RMSNorm vs the PyTorch implementation it replaces (one program per
+row; square/mean/rsqrt/scale fused into a single launch). Per-call latency, timed
+with CUDA events (min over 5 blocks of 500 calls):
+
+| shape (rows x hidden) | PyTorch (us) | Triton (us) | speedup |
+| --- | --- | --- | --- |
+| 1 x 896 | 55.6 | 35.7 | 1.56x |
+| 32 x 896 | 56.2 | 35.1 | 1.60x |
+| 256 x 896 | 59.2 | 36.0 | 1.64x |
+| 4096 x 896 | 166.0 | 45.2 | 3.68x |
+
+The kernel wins at every size by collapsing several PyTorch kernel launches into
+one; the gap widens with row count as the PyTorch path becomes bandwidth-bound
+while the fused kernel stays efficient. Correctness is verified within atol 1e-4
+over 10+ shapes in `tests/test_kernels.py`, and the kernel is enabled by default
+(`engine.model.USE_TRITON_RMSNORM`), so all earlier milestone tests run through
+it and still pass (6 passed).
+
+Reproducibility: a second run gave 1.55 / 1.56 / 1.59 / 3.67x, within ~3% of the
+above on every shape.
