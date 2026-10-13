@@ -142,8 +142,13 @@ class Qwen2Model:
         weights = {k: v.to(device=device, dtype=dtype) for k, v in raw.items()}
         return cls(cfg, weights, device)
 
-    def _attention(self, x, layer, cos, sin):
-        """Grouped-query attention with a causal mask for one decoder layer."""
+    def _attention(self, x, layer, cos, sin, cache):
+        """Grouped-query attention with a causal mask for one decoder layer.
+
+        When `cache` is given, the new tokens' keys/values are appended to it and
+        attention runs against the full (past + new) key/value history, so decode
+        steps only project the new token rather than the whole sequence.
+        """
         cfg = self.cfg
         b, t, _ = x.shape
         p = f"model.layers.{layer}.self_attn."
@@ -157,19 +162,36 @@ class Qwen2Model:
 
         q, k = apply_rope(q, k, cos, sin)
 
+        if cache is not None:
+            k, v = cache.update(layer, k, v)
+
         n_rep = cfg.num_attention_heads // cfg.num_key_value_heads
         k = repeat_kv(k, n_rep)
         v = repeat_kv(v, n_rep)
 
+        s = k.shape[2]
         scale = cfg.head_dim ** -0.5
         scores = torch.matmul(q, k.transpose(-1, -2)) * scale
-        mask = torch.full((t, t), float("-inf"), device=x.device, dtype=scores.dtype)
-        mask = torch.triu(mask, diagonal=1)
-        scores = scores + mask
+        scores = scores + self._causal_mask(t, s, scores.dtype, x.device)
         probs = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
         out = torch.matmul(probs, v)
         out = out.transpose(1, 2).reshape(b, t, -1)
         return F.linear(out, self.w[p + "o_proj.weight"])
+
+    @staticmethod
+    def _causal_mask(t, s, dtype, device):
+        """Additive mask (t, s): the t new queries are the last t of s keys.
+
+        Query i (the (s - t + i)-th position) may attend to key j only if
+        j <= s - t + i. For prefill (s == t) this is the usual triangular mask;
+        for a single-token decode step (t == 1) nothing is masked.
+        """
+        q_idx = torch.arange(t, device=device).view(t, 1) + (s - t)
+        k_idx = torch.arange(s, device=device).view(1, s)
+        allowed = k_idx <= q_idx
+        mask = torch.zeros((t, s), dtype=dtype, device=device)
+        mask.masked_fill_(~allowed, float("-inf"))
+        return mask
 
     def _mlp(self, x, layer):
         """SwiGLU feed-forward: down(silu(gate(x)) * up(x))."""
@@ -178,19 +200,24 @@ class Qwen2Model:
         up = F.linear(x, self.w[p + "up_proj.weight"])
         return F.linear(F.silu(gate) * up, self.w[p + "down_proj.weight"])
 
-    def forward(self, input_ids):
-        """Run the full forward pass and return logits of shape (B, T, vocab)."""
+    def forward(self, input_ids, cache=None, start_pos=0):
+        """Run the forward pass and return logits of shape (B, T, vocab).
+
+        `start_pos` is the absolute position of the first input token (0 for a
+        fresh prompt, or the current sequence length when decoding with a cache),
+        so RoPE and the causal mask use correct positions.
+        """
         cfg = self.cfg
         x = F.embedding(input_ids, self.w["model.embed_tokens.weight"])
         t = input_ids.shape[1]
-        cos = self.cos[:t]
-        sin = self.sin[:t]
+        cos = self.cos[start_pos:start_pos + t]
+        sin = self.sin[start_pos:start_pos + t]
 
         for layer in range(cfg.num_hidden_layers):
             ln1 = self.w[f"model.layers.{layer}.input_layernorm.weight"]
             residual = x
             x = rms_norm(x, ln1, cfg.rms_norm_eps)
-            x = residual + self._attention(x, layer, cos, sin)
+            x = residual + self._attention(x, layer, cos, sin, cache)
 
             ln2 = self.w[f"model.layers.{layer}.post_attention_layernorm.weight"]
             residual = x
