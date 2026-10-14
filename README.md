@@ -12,7 +12,8 @@ PyTorch + Triton to understand how modern LLM serving actually works.
   visible (~5.7x vs recomputing the full context).
 - **Continuous batching** — a scheduler with a request queue that admits,
   decodes, evicts, and compacts sequences every step at ragged lengths; batched
-  output is token-for-token identical to single-sequence greedy.
+  output is token-for-token identical to single-sequence greedy. Runs bf16 with a
+  CUDA-graph decode step (one graph per batch size) to cut per-step launch cost.
 - **Triton kernel** — a fused RMSNorm kernel that replaces the PyTorch version
   everywhere (up to ~3.7x faster, verified to atol 1e-4).
 - **Honest benchmarks** — single-sequence, concurrency, kernel, and a
@@ -65,19 +66,22 @@ All results, with GPU name and date, are in [BENCHMARKS.md](BENCHMARKS.md).
 ## This engine vs vLLM
 
 Qwen2.5-0.5B, prompt "Once upon a time, in a land far away,", max_tokens 64,
-total tokens/sec across all sequences, on an **NVIDIA RTX A5000**. This engine is
-fp32; vLLM uses its default bf16 + paged attention.
+total tokens/sec across all sequences, on an **NVIDIA RTX A5000**. The engine runs
+bf16 with a CUDA-graph decode path (M6); vLLM uses its default bf16 + paged
+attention.
 
-| concurrency | this engine, fp32 (tok/s) | vLLM, bf16 (tok/s) |
-| --- | --- | --- |
-| 1 | 45.5 | 416.8 |
-| 4 | 171.6 | 1427.4 |
-| 8 | 324.6 | 2788.1 |
-| 16 | 585.4 | 5434.0 |
-| 32 | 917.3 | 9592.8 |
+| concurrency | this engine, bf16+graph (tok/s) | vLLM, bf16 (tok/s) | gap |
+| --- | --- | --- | --- |
+| 1 | 278.0 | 415.4 | 1.5x |
+| 4 | 747.7 | 1436.7 | 1.9x |
+| 8 | 1140.4 | 2839.9 | 2.5x |
+| 16 | 1524.5 | 5499.1 | 3.6x |
+| 32 | 1812.0 | 9039.7 | 5.0x |
 
-vLLM is ~9–10x faster in absolute throughput, but both scale with concurrency in
-the same way — the batching win is real here too.
+Running the engine in bf16 and replaying a captured CUDA graph for each decode
+step (Milestone 6) cut the gap at low concurrency from ~9x to ~1.5x; at high
+concurrency vLLM's paged attention still pulls ahead. The original fp32 numbers
+and the full breakdown are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Not implemented
 

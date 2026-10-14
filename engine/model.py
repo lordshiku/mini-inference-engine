@@ -144,13 +144,16 @@ class Qwen2Model:
     """
 
     def __init__(self, config, weights, device):
+        """Store config/weights and precompute the RoPE tables in the model dtype."""
         self.cfg = config
         self.device = device
         self.w = weights
         self.dtype = weights["model.embed_tokens.weight"].dtype
         max_pos = config.max_position_embeddings
+        # RoPE tables in the model's dtype so decode stays in that dtype end to end
+        # (fp32 for the logit test, bf16 for fast inference).
         self.cos, self.sin = build_rope_cache(
-            config.head_dim, max_pos, config.rope_theta, device, torch.float32
+            config.head_dim, max_pos, config.rope_theta, device, self.dtype
         )
 
     @classmethod

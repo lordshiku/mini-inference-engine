@@ -35,15 +35,16 @@ class GraphDecoder:
         self.max_len = max_len
         dev = model.device
         nl, nkv, hd = cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim
+        dt = model.dtype
 
         # Static KV cache and per-step inputs that the captured graph reads from.
-        self.kbuf = torch.zeros(nl, 1, nkv, max_len, hd, device=dev)
-        self.vbuf = torch.zeros(nl, 1, nkv, max_len, hd, device=dev)
+        self.kbuf = torch.zeros(nl, 1, nkv, max_len, hd, device=dev, dtype=dt)
+        self.vbuf = torch.zeros(nl, 1, nkv, max_len, hd, device=dev, dtype=dt)
         self.tok = torch.zeros(1, 1, dtype=torch.long, device=dev)
         self.pos_idx = torch.zeros(1, dtype=torch.long, device=dev)
-        self.cos_b = torch.zeros(1, hd, device=dev)
-        self.sin_b = torch.zeros(1, hd, device=dev)
-        self.mask = torch.full((1, 1, 1, max_len), float("-inf"), device=dev)
+        self.cos_b = torch.zeros(1, hd, device=dev, dtype=dt)
+        self.sin_b = torch.zeros(1, hd, device=dev, dtype=dt)
+        self.mask = torch.full((1, 1, 1, max_len), float("-inf"), device=dev, dtype=dt)
         self._capture()
 
     def _decode_once(self):

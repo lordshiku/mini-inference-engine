@@ -19,11 +19,17 @@ def _rms_norm_fwd(x_ptr, w_ptr, out_ptr, row_stride, n_cols, eps,
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
-    x = tl.load(x_ptr + row * row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x_raw = tl.load(x_ptr + row * row_stride + cols, mask=mask, other=0.0)
+    in_dtype = x_raw.dtype
+    x = x_raw.to(tl.float32)
     var = tl.sum(x * x, axis=0) / n_cols
     rstd = 1.0 / tl.sqrt(var + eps)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = x * rstd * w
+    # Match the PyTorch reference exactly: round the normalized value to the input
+    # dtype BEFORE scaling by the weight (weight * x.to(dtype)). This is a no-op in
+    # fp32 but makes bf16 bit-identical to the reference.
+    x_hat = (x * rstd).to(in_dtype)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    y = w * x_hat
     tl.store(out_ptr + row * row_stride + cols, y, mask=mask)
 
 

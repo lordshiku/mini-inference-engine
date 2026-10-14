@@ -92,29 +92,57 @@ it and still pass (6 passed).
 Reproducibility: a second run gave 1.55 / 1.56 / 1.59 / 3.67x, within ~3% of the
 above on every shape.
 
-## Milestone 5 — this engine vs vLLM (same model, prompt, concurrency)
+## Milestone 5 / 6 — this engine vs vLLM (same model, prompt, concurrency)
 
 `PYTHONPATH=. python bench/bench_concurrent.py` and
-`PYTHONPATH=. python bench/bench_vllm.py` — 2026-10-13, NVIDIA RTX A5000
+`PYTHONPATH=. python bench/bench_vllm.py` — M5: 2026-10-13, M6: 2026-10-14,
+NVIDIA RTX A5000.
 
 Same model (Qwen2.5-0.5B), same prompt ("Once upon a time, in a land far away,"),
 same concurrency levels, max_tokens = 64, total tokens/sec across all sequences.
-This engine runs fp32; vLLM runs its default bf16 with paged attention — so this
-is "where a simple from-scratch engine lands next to a production one," not a
-dtype-matched contest.
+vLLM runs its default bf16 with paged attention. The M5 engine column is fp32
+eager; the M6 engine column is the same engine run in bf16 with the CUDA-graph
+decode path inside the scheduler (see Milestone 6 below).
 
-| concurrency | this engine, fp32 (tok/s) | vLLM, bf16 (tok/s) |
-| --- | --- | --- |
-| 1 | 45.5 | 416.8 |
-| 4 | 171.6 | 1427.4 |
-| 8 | 324.6 | 2788.1 |
-| 16 | 585.4 | 5434.0 |
-| 32 | 917.3 | 9592.8 |
+| concurrency | engine M5 fp32 (tok/s) | engine M6 bf16+graph (tok/s) | vLLM bf16 (tok/s) | M6 gap to vLLM |
+| --- | --- | --- | --- | --- |
+| 1 | 45.5 | 278.0 | 415.4 | 1.5x |
+| 4 | 171.6 | 747.7 | 1436.7 | 1.9x |
+| 8 | 324.6 | 1140.4 | 2839.9 | 2.5x |
+| 16 | 585.4 | 1524.5 | 5499.1 | 3.6x |
+| 32 | 917.3 | 1812.0 | 9039.7 | 5.0x |
 
-vLLM is ~9–10x faster in absolute throughput (bf16, paged attention, fused
-kernels, optimized sampling), but both engines show the same batching win:
-throughput scales roughly with concurrency until compute starts to bind.
+Reproducibility: engine M6 second run gave 274.6 / 730.5 / 1091.8 / 1560.7 /
+1890.4 tok/s (within ~4%); vLLM second run gave 399.2 / 1418.2 / 2811.7 / 5423.5 /
+9403.6 tok/s (within ~4%). All benchmark numbers in this file reproduce across
+two runs within 10%.
 
-Reproducibility: vLLM second run gave 415.0 / 1435.1 / 2850.9 / 5522.0 / 9071.8
-tok/s — within ~5% of the above on every level (worst case 5.4% at concurrency
-32). All benchmark numbers in this file reproduce across two runs within 10%.
+## Milestone 6 — closing the gap with vLLM (bf16 + CUDA-graph scheduler)
+
+Two changes, both applied to the existing engine:
+
+- **bf16 end to end.** `Qwen2Model.from_pretrained(..., dtype=torch.bfloat16)`
+  runs the whole forward (and RoPE tables) in bf16. The fp32 path is kept as a
+  flag; the logit test still loads fp32 and passes < 1e-3. The Triton RMSNorm was
+  adjusted to round the normalized value to the input dtype before scaling by the
+  weight, so it is bit-identical to the PyTorch reference in bf16 too.
+- **CUDA-graph decode inside the scheduler.** The batched continuous-batching
+  decode step is captured as a CUDA graph (one per batch size, cached) and
+  replayed, collapsing ~hundreds of kernel launches per step into one. The graph
+  runs a fixed `max_batch` rows (inactive rows are harmless dummies) and attends
+  over the full `max_len` cache with a per-row mask, so shapes stay static.
+
+Effect (concurrency 1 → 32): throughput rose from 45.5/171.6/324.6/585.4/917.3
+(fp32 eager) to 278.0/747.7/1140.4/1524.5/1812.0 (bf16+graph). The biggest win is
+at low concurrency — concurrency 1 went 6.1x faster and the gap to vLLM shrank
+from ~9x to ~1.5x — because that regime was entirely launch-bound and the graph
+removes that overhead. At high concurrency vLLM's paged attention and larger
+effective batching pull ahead (gap ~5x at 32); closing that would need paged KV
+and a batched prefill, which are out of scope.
+
+The M3 acceptance still holds in this configuration: throughput@16 = 5.48x
+throughput@1 (>= 3x). Correctness: the fp32 batching test still matches
+standalone greedy token-for-token through the graph path, and a bf16 test
+teacher-forces every engine-produced token against a single-pass reference and
+requires it to be the greedy choice within a loose logit tolerance (bf16
+near-ties stay within ~0.4; tol 2.0).
