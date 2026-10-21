@@ -12,6 +12,8 @@ Results on an RTX A5000, same model, prompt, and concurrency levels:
 | 16 | 1525 | 5499 | 0.28 |
 | 32 | 1812 | 9040 | 0.20 |
 
+To run it yourself, see [QUICKSTART.md](QUICKSTART.md).
+
 Both bf16. At concurrency 1 the engine is within 1.5x of vLLM. The gap widens with concurrency because vLLM has paged attention and batched prefill and this engine doesn't (see "What's missing" below). Everything in this table reproduces within 10% across runs; the full set of numbers, including the fp32 baseline before the CUDA-graph work, is in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## What's in it
