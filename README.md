@@ -1,94 +1,72 @@
 # mini-inference-engine
 
-A small, from-scratch inference engine for **Qwen2.5-0.5B**, built in plain
-PyTorch + Triton to understand how modern LLM serving actually works.
+I wanted to understand what actually happens between "here are some model weights" and "here are tokens coming out at N tokens/sec", so I built the serving stack for Qwen2.5-0.5B myself and measured it against vLLM on the same GPU.
 
-- **From-scratch forward pass** — Qwen2.5 (embeddings, RMSNorm, RoPE,
-  grouped-query attention, SwiGLU MLP, tied LM head) implemented directly from
-  the safetensors weights, with no `transformers` at runtime. Logits match the
-  `transformers` reference to < 1e-3 (fp32).
-- **KV cache** — incremental decode that only computes attention for the new
-  token, plus a CUDA-graph decode path that makes the cache's per-token win
-  visible (~5.7x vs recomputing the full context).
-- **Continuous batching** — a scheduler with a request queue that admits,
-  decodes, evicts, and compacts sequences every step at ragged lengths; batched
-  output is token-for-token identical to single-sequence greedy. Runs bf16 with a
-  CUDA-graph decode step (one graph per batch size) to cut per-step launch cost.
-- **Triton kernel** — a fused RMSNorm kernel that replaces the PyTorch version
-  everywhere (up to ~3.7x faster, verified to atol 1e-4).
-- **Honest benchmarks** — single-sequence, concurrency, kernel, and a
-  head-to-head against **vLLM** on the same model/prompts/concurrency.
+Results on an RTX A5000, same model, prompt, and concurrency levels:
 
-## Architecture
+| concurrency | this engine (tok/s) | vLLM (tok/s) | ratio |
+| --- | --- | --- | --- |
+| 1 | 278 | 415 | 0.67 |
+| 4 | 748 | 1437 | 0.52 |
+| 8 | 1140 | 2840 | 0.40 |
+| 16 | 1525 | 5499 | 0.28 |
+| 32 | 1812 | 9040 | 0.20 |
+
+Both bf16. At concurrency 1 the engine is within 1.5x of vLLM. The gap widens with concurrency because vLLM has paged attention and batched prefill and this engine doesn't (see "What's missing" below). Everything in this table reproduces within 10% across runs; the full set of numbers, including the fp32 baseline before the CUDA-graph work, is in [BENCHMARKS.md](BENCHMARKS.md).
+
+## What's in it
+
+**Forward pass from the raw weights.** Qwen2.5's architecture (RMSNorm, RoPE, grouped-query attention with 14 Q heads over 2 KV heads, SwiGLU MLP, tied embeddings) implemented in plain PyTorch straight from the safetensors file. `transformers` is used only in tests, as the reference: logits match it to within 1e-3 in fp32 on every test prompt.
+
+**KV cache.** Decode steps only compute attention for the new token against cached keys/values. Measured per-step speedup is 5.7x versus recomputing a 256-token context.
+
+**CUDA-graph decode.** This turned out to be the biggest single win. A decode step for a model this small is ~430 kernel launches, and in eager mode the launch overhead dominates the actual math: the KV cache only showed a 1.5x gain until the launches were captured into a graph and replayed. Going from eager fp32 to bf16 + graph took single-stream throughput from 45 to 278 tok/s.
+
+**Continuous batching.** A scheduler with a request queue. Each step it admits waiting requests into free rows of a preallocated batched cache, runs one decode step across all active sequences at ragged lengths, evicts the ones that finished, and compacts. One CUDA graph is captured per batch size. Batched greedy output is token-for-token identical to running each prompt alone, which the tests check on 8 prompts.
+
+**Fused RMSNorm in Triton.** Replaces the PyTorch RMSNorm everywhere in the model. Up to 3.7x faster at large row counts, checked against the PyTorch version to 1e-4 across random shapes.
+
+## Layout
 
 ```
 engine/
-  model.py        Qwen2.5 forward pass (RMSNorm, RoPE, GQA + causal mask, SwiGLU, tied head)
-  cache.py        KVCache (single sequence) and BatchedKVCache (continuous batching)
-  generate.py     sampling (greedy / temperature / top-p) and greedy generation
-  graph_decode.py CUDA-graph single-sequence decode over a static KV cache
-  scheduler.py    Engine: request queue + continuous-batching run loop
-  kernels.py      Triton fused RMSNorm
-tests/            one test file per milestone
-bench/            benchmark scripts; results in BENCHMARKS.md
+  model.py        forward pass
+  cache.py        KVCache (single sequence) and BatchedKVCache
+  graph_decode.py CUDA-graph decode over a static cache
+  scheduler.py    Engine: request queue + continuous batching loop
+  generate.py     greedy / temperature / top-p sampling
+  kernels.py      Triton RMSNorm
+tests/            one file per milestone
+bench/            benchmark scripts
 ```
 
-The forward pass stores weights as plain tensors in a dict and wires explicit
-building blocks together, favouring readability over abstraction. Decode reuses
-the keys/values in the cache; continuous batching keeps one preallocated batched
-cache with per-row lengths so ragged-length sequences share one batched step.
+Weights go in `weights/qwen2.5-0.5b/` (model config: hidden 896, 24 layers, head_dim 64, vocab 151936, RoPE theta 1e6).
 
-**Model config:** hidden 896, 24 layers, 14 query heads, 2 KV heads (GQA),
-head_dim 64, SwiGLU intermediate 4864, RoPE theta 1e6, tied embeddings, vocab
-151936. Weights live in `weights/qwen2.5-0.5b/`.
+## Running it
 
-## Running the tests
+Needs a CUDA GPU and the weights.
 
 ```bash
-pytest                      # all milestones (requires CUDA + the weights)
-pytest tests/test_logits.py # M1: logits vs transformers (< 1e-3, fp32)
-pytest tests/test_cache.py  # M2: cached == uncached; graph decode == eager
-pytest tests/test_batching.py  # M3: batched == standalone greedy, 8 prompts
-pytest tests/test_kernels.py   # M4: Triton RMSNorm vs PyTorch (atol 1e-4)
+pytest                          # everything
+pytest tests/test_logits.py     # forward pass vs transformers
+pytest tests/test_cache.py      # cached == uncached; graph == eager
+pytest tests/test_batching.py   # batched == standalone
+pytest tests/test_kernels.py    # Triton RMSNorm vs PyTorch
+
+PYTHONPATH=. python bench/bench_single.py       # prefill + cached vs uncached decode
+PYTHONPATH=. python bench/bench_concurrent.py   # throughput at concurrency 1..32
+PYTHONPATH=. python bench/bench_kernels.py      # Triton vs eager RMSNorm
+PYTHONPATH=. python bench/bench_vllm.py         # same workload through vLLM
 ```
 
-## Running the benchmarks
+## What's missing
 
-```bash
-PYTHONPATH=. python bench/bench_single.py       # M2: prefill + cached vs uncached decode
-PYTHONPATH=. python bench/bench_concurrent.py   # M3: throughput at concurrency 1..32
-PYTHONPATH=. python bench/bench_kernels.py       # M4: Triton RMSNorm vs eager
-PYTHONPATH=. python bench/bench_vllm.py          # M5: same workload through vLLM
-```
+Scoped out on purpose to keep this to a week:
 
-All results, with GPU name and date, are in [BENCHMARKS.md](BENCHMARKS.md).
+- **Paged KV cache.** The batched cache is contiguous and preallocated per row, so memory isn't packed across sequences. This is most of the gap to vLLM at high concurrency.
+- **Batched prefill.** New requests are prefilled one at a time before joining the batch.
+- **Speculative decoding**, quantization, an HTTP server, multi-GPU.
 
-## This engine vs vLLM
+## How it was built
 
-Qwen2.5-0.5B, prompt "Once upon a time, in a land far away,", max_tokens 64,
-total tokens/sec across all sequences, on an **NVIDIA RTX A5000**. The engine runs
-bf16 with a CUDA-graph decode path (M6); vLLM uses its default bf16 + paged
-attention.
-
-| concurrency | this engine, bf16+graph (tok/s) | vLLM, bf16 (tok/s) | gap |
-| --- | --- | --- | --- |
-| 1 | 278.0 | 415.4 | 1.5x |
-| 4 | 747.7 | 1436.7 | 1.9x |
-| 8 | 1140.4 | 2839.9 | 2.5x |
-| 16 | 1524.5 | 5499.1 | 3.6x |
-| 32 | 1812.0 | 9039.7 | 5.0x |
-
-Running the engine in bf16 and replaying a captured CUDA graph for each decode
-step (Milestone 6) cut the gap at low concurrency from ~9x to ~1.5x; at high
-concurrency vLLM's paged attention still pulls ahead. The original fp32 numbers
-and the full breakdown are in [BENCHMARKS.md](BENCHMARKS.md).
-
-## Not implemented
-
-Deliberately out of scope (see SPEC.md non-goals):
-
-- **Paged KV cache** — this engine uses a contiguous preallocated per-row cache,
-  not vLLM-style paged blocks, so memory is not shared/packed across sequences.
-- **Speculative decoding** — no draft model or token acceptance; every token is
-  produced by a single forward step.
-- Also absent: HTTP server, quantization, multi-GPU, and training.
+Spec-first: [SPEC.md](SPEC.md) defines six milestones, each with an acceptance test it had to pass before the next one started (logit match, cache == no-cache, batched == standalone, kernel allclose, benchmarks reproducible within 10%). Claude Code did most of the implementation against that spec; a separate fresh-context reviewer agent checked each milestone's diff against the spec before it was committed. The reviewer caught one real problem, in the KV-cache benchmark, where the headline speedup was crediting CUDA graphs rather than the cache. That got reworked into a fair comparison. The decisions and reviewer findings for each milestone are in [DEVLOG.md](DEVLOG.md).
